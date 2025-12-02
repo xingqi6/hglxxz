@@ -1,110 +1,129 @@
 import os
 import base64
-import mimetypes
 import logging
 import subprocess
 import shutil
-from datetime import datetime, timezone
-from urllib.parse import quote, unquote, urlparse
-from xml.etree import ElementTree as ET
-from typing import Generator, Optional
-
-from fastapi import FastAPI, Request, HTTPException, Response, BackgroundTasks
-from fastapi.responses import HTMLResponse, StreamingResponse
-from fastapi.concurrency import run_in_threadpool
 from huggingface_hub import HfFileSystem, HfApi
+from fastapi import FastAPI, Request, Response, BackgroundTasks
+from fastapi.responses import HTMLResponse
 
-# 【调试模式】开启日志，不再静默
+# 保持调试模式，以便你查看 Tracker 是否生效
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("SystemKernel")
 
-HTML_TEMPLATE = """<h1>System Maintenance Mode</h1>"""
+# 热门 Tracker 列表 (2025精选)
+TRACKERS = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://9.rarbg.to:2710/announce",
+    "udp://9.rarbg.me:2990/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://tracker.cyberia.is:6969/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://tracker.moeking.me:6969/announce",
+    "http://tracker.gbitt.info:80/announce",
+    "udp://tracker.tiny-vps.com:6969/announce",
+    "udp://tracker.auctor.tv:6969/announce",
+    "udp://opentracker.i2p.rocks:6969/announce",
+    "https://opentracker.i2p.rocks:443/announce",
+    "udp://tracker.openbittorrent.com:80/announce",
+    "http://tracker.openbittorrent.com:80/announce",
+    "udp://tracker.leechers-paradise.org:6969/announce",
+    "udp://tracker.coppersurfer.tk:6969/announce",
+    "udp://tracker.zer0day.to:1337/announce",
+    "udp://tracker.leechers-paradise.org:6969/announce",
+    "udp://coppersurfer.tk:6969/announce"
+]
+TRACKER_STR = ",".join(TRACKERS)
 
 class SystemKernel:
     def __init__(self, u_id, d_set, k_val):
-        self.u = u_id
-        self.d = d_set
         self.r_id = f"{u_id}/{d_set}"
-        self.token = k_val
-        self.fs = HfFileSystem(token=k_val)
         self.api = HfApi(token=k_val)
-        self.root = f"datasets/{self.r_id}"
         self.cache_dir = "/app/cache"
 
-    def _chk(self, fp: str):
-        # 简化版检查
-        pass
-
-    def _flush(self, p: str):
-        try:
-            self.fs.invalidate_cache(p)
-        except: pass
-
-    # --- 调试版后台任务 ---
     def _debug_worker(self, encoded_link: str):
-        logger.info(">>> 收到后台任务，开始处理...")
-        
+        logger.info(">>> [强力模式] 开始处理任务...")
         try:
             magnet = base64.b64decode(encoded_link).decode('utf-8')
-            logger.info(f"--- 磁力链解码成功: {magnet[:20]}...")
-        except Exception as e:
-            logger.error(f"!!! Base64 解码失败: {e}")
-            return
+        except: return
 
         if not os.path.exists(self.cache_dir): os.makedirs(self.cache_dir)
         
         try:
-            logger.info(">>> 启动 Aria2 下载...")
-            # 【调试关键】去掉 quiet 模式，允许输出到控制台
+            logger.info(">>> 正在注入 Trackers 并启动下载...")
             cmd = [
                 "aria2c",
                 "-d", self.cache_dir,
                 "--seed-time=0",
-                "--bt-stop-timeout=600",   # 10分钟没速度就退出
+                "--bt-stop-timeout=600",
                 "--file-allocation=none",
-                "--summary-interval=10",   # 每10秒打印一次进度
+                "--summary-interval=10",
+                f"--bt-tracker={TRACKER_STR}",  # 关键修改：注入 Tracker
                 magnet
             ]
             
-            # 【调试关键】捕获输出，而不是丢弃
             process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            
-            # 实时打印下载日志
             for line in process.stdout:
-                print(f"[Aria2] {line.strip()}")
+                # 只打印进度相关的日志，减少刷屏
+                if "CN:" in line or "NOTICE" in line or "ERROR" in line:
+                    print(f"[Aria2] {line.strip()}")
             
             process.wait()
             
             if process.returncode != 0:
-                logger.error(f"!!! Aria2 下载失败，退出码: {process.returncode}")
+                logger.error(f"!!! 下载依然失败 (Exit: {process.returncode})。建议放弃此资源。")
                 return
             
-            logger.info(">>> 下载完成，开始上传到 Datasets...")
-            
-            # 遍历上传
-            file_count = 0
+            # 上传逻辑
+            logger.info(">>> 下载成功！开始上传...")
             for root, dirs, files in os.walk(self.cache_dir):
                 for file in files:
                     if file.endswith(".aria2"): continue
-                    
                     local_path = os.path.join(root, file)
                     rel_path = os.path.relpath(local_path, self.cache_dir)
-                    
-                    logger.info(f"正在上传: {rel_path} ...")
                     try:
                         self.api.upload_file(
                             path_or_fileobj=local_path,
                             path_in_repo=rel_path,
                             repo_id=self.r_id,
                             repo_type="dataset",
-                            commit_message=f"Debug upload: {file}"
+                            commit_message=f"Sync: {file}"
                         )
-                        logger.info(f"上传成功: {file}")
-                        file_count += 1
+                        logger.info(f"OK: {file}")
                     except Exception as e:
-                        logger.error(f"!!! 上传失败 {file}: {e}")
+                        logger.error(f"Upload Fail: {e}")
             
-            if file_count == 0:
+            shutil.rmtree(self.cache_dir)
+            logger.info(">>> 任务完成")
+            
+        except Exception as e:
+            logger.error(f"Error: {e}")
+            if os.path.exists(self.cache_dir): shutil.rmtree(self.cache_dir)
+
+    async def op_trigger_debug(self, b64_link: str, bg_tasks: BackgroundTasks):
+        bg_tasks.add_task(self._debug_worker, b64_link)
+        return Response(content="Tracker Boosted Task Started", status_code=202)
+
+app = FastAPI()
+
+@app.post("/sys/maintenance/trigger")
+async def maintenance_trigger(req: Request, bg_tasks: BackgroundTasks):
+    au = req.headers.get("Authorization")
+    if not au: return Response(status_code=401)
+    try:
+        dec = base64.b64decode(au[6:]).decode()
+        ur, tk = dec.split(":", 1)
+        u, d = ur.split("/", 1) if "/" in ur else ("user", "default")
+        body = await req.body()
+        b64_data = body.decode('utf-8').strip()
+        ker = SystemKernel(u, d, tk)
+        return await ker.op_trigger_debug(b64_data, bg_tasks)
+    except: return Response(status_code=500)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860)            if file_count == 0:
                 logger.warning("!!! 警告：Aria2 似乎没有下载到任何有效文件。")
 
             # 清理
