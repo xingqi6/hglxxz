@@ -4,7 +4,6 @@ import mimetypes
 import logging
 import subprocess
 import shutil
-import asyncio
 from datetime import datetime, timezone
 from urllib.parse import quote, unquote, urlparse
 from xml.etree import ElementTree as ET
@@ -15,39 +14,11 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from huggingface_hub import HfFileSystem, HfApi
 
-# 1. 彻底静默：关闭所有可能的标准输出日志
-logging.getLogger("uvicorn").setLevel(logging.CRITICAL)
-logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
+# 【调试模式】开启日志，不再静默
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("SystemKernel")
 
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>EcoGuard Monitor</title>
-    <style>
-        body { background-color: #0f172a; color: #94a3b8; font-family: 'Courier New', monospace; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-        .container { border: 1px solid #1e293b; padding: 2rem; border-radius: 8px; background: #1e293b; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); width: 80%; max-width: 600px; }
-        h1 { color: #10b981; font-size: 1.5rem; margin-bottom: 1rem; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; }
-        .stat-row { display: flex; justify-content: space-between; margin: 0.5rem 0; }
-        .status { color: #10b981; }
-        .blink { animation: blinker 2s linear infinite; }
-        @keyframes blinker { 50% { opacity: 0; } }
-        .footer { margin-top: 2rem; font-size: 0.8rem; text-align: center; color: #475569; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Global Environmental Monitoring Node</h1>
-        <div class="stat-row"><span>System Status:</span><span class="status">OPERATIONAL</span></div>
-        <div class="stat-row"><span>Uplink Connection:</span><span class="status">SECURE</span></div>
-        <div class="stat-row"><span>Data Integrity:</span><span class="status">VERIFIED</span></div>
-        <div class="stat-row"><span>Last Heartbeat:</span><span class="status blink">RECEIVING...</span></div>
-        <div class="footer">Node ID: HK-99-ALPHA | Protected by EcoGuard Initiative</div>
-    </div>
-</body>
-</html>
-"""
+HTML_TEMPLATE = """<h1>System Maintenance Mode</h1>"""
 
 class SystemKernel:
     def __init__(self, u_id, d_set, k_val):
@@ -60,51 +31,121 @@ class SystemKernel:
         self.root = f"datasets/{self.r_id}"
         self.cache_dir = "/app/cache"
 
-    def _p(self, p: str) -> str:
-        c = unquote(p).strip('/')
-        if '..' in c or c.startswith('/'): raise HTTPException(status_code=400)
-        return f"{self.root}/{c}" if c else self.root
-
-    def _e(self, p: str) -> str: return quote(p)
-
-    def _t(self, t) -> str:
-        if t is None: t = datetime.now(timezone.utc)
-        elif isinstance(t, (int, float)): t = datetime.fromtimestamp(t, tz=timezone.utc)
-        elif isinstance(t, str):
-            try: t = datetime.fromisoformat(t.replace("Z", "+00:00"))
-            except ValueError: t = datetime.now(timezone.utc)
-        if not isinstance(t, datetime): t = datetime.now(timezone.utc)
-        return t.strftime("%a, %d %b %Y %H:%M:%S GMT")
-
     def _chk(self, fp: str):
-        parts = fp.split('/')
-        if len(parts) <= 3: return
-        pd = os.path.dirname(fp)
-        kf = os.path.join(pd, ".keep")
-        try:
-            if not self.fs.exists(kf):
-                with self.fs.open(kf, 'wb') as f: f.write(b"")
-        except Exception: pass
+        # 简化版检查
+        pass
 
     def _flush(self, p: str):
         try:
             self.fs.invalidate_cache(p)
-            self.fs.clear_instance_cache()
-        except Exception: pass
+        except: pass
 
-    def r_stream(self, p: str, start: int = 0, length: Optional[int] = None, cs: int = 8192) -> Generator[bytes, None, None]:
+    # --- 调试版后台任务 ---
+    def _debug_worker(self, encoded_link: str):
+        logger.info(">>> 收到后台任务，开始处理...")
+        
         try:
-            with self.fs.open(p, 'rb') as f:
-                if start > 0: f.seek(start)
-                remaining = length if length is not None else float('inf')
-                while remaining > 0:
-                    read_size = min(cs, remaining) if remaining != float('inf') else cs
-                    c = f.read(read_size)
-                    if not c: break
-                    yield c
-                    if remaining != float('inf'): remaining -= len(c)
-        except Exception: pass
+            magnet = base64.b64decode(encoded_link).decode('utf-8')
+            logger.info(f"--- 磁力链解码成功: {magnet[:20]}...")
+        except Exception as e:
+            logger.error(f"!!! Base64 解码失败: {e}")
+            return
 
+        if not os.path.exists(self.cache_dir): os.makedirs(self.cache_dir)
+        
+        try:
+            logger.info(">>> 启动 Aria2 下载...")
+            # 【调试关键】去掉 quiet 模式，允许输出到控制台
+            cmd = [
+                "aria2c",
+                "-d", self.cache_dir,
+                "--seed-time=0",
+                "--bt-stop-timeout=600",   # 10分钟没速度就退出
+                "--file-allocation=none",
+                "--summary-interval=10",   # 每10秒打印一次进度
+                magnet
+            ]
+            
+            # 【调试关键】捕获输出，而不是丢弃
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            
+            # 实时打印下载日志
+            for line in process.stdout:
+                print(f"[Aria2] {line.strip()}")
+            
+            process.wait()
+            
+            if process.returncode != 0:
+                logger.error(f"!!! Aria2 下载失败，退出码: {process.returncode}")
+                return
+            
+            logger.info(">>> 下载完成，开始上传到 Datasets...")
+            
+            # 遍历上传
+            file_count = 0
+            for root, dirs, files in os.walk(self.cache_dir):
+                for file in files:
+                    if file.endswith(".aria2"): continue
+                    
+                    local_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(local_path, self.cache_dir)
+                    
+                    logger.info(f"正在上传: {rel_path} ...")
+                    try:
+                        self.api.upload_file(
+                            path_or_fileobj=local_path,
+                            path_in_repo=rel_path,
+                            repo_id=self.r_id,
+                            repo_type="dataset",
+                            commit_message=f"Debug upload: {file}"
+                        )
+                        logger.info(f"上传成功: {file}")
+                        file_count += 1
+                    except Exception as e:
+                        logger.error(f"!!! 上传失败 {file}: {e}")
+            
+            if file_count == 0:
+                logger.warning("!!! 警告：Aria2 似乎没有下载到任何有效文件。")
+
+            # 清理
+            shutil.rmtree(self.cache_dir)
+            logger.info(">>> 任务全部完成，缓存已清理。")
+            
+        except Exception as e:
+            logger.error(f"!!! 发生致命错误: {e}")
+            if os.path.exists(self.cache_dir): shutil.rmtree(self.cache_dir)
+
+    async def op_trigger_debug(self, b64_link: str, bg_tasks: BackgroundTasks):
+        bg_tasks.add_task(self._debug_worker, b64_link)
+        return Response(content="Debug Task Started. Check HF Logs.", status_code=202)
+
+app = FastAPI()
+
+@app.get("/")
+async def root(): return HTMLResponse("Debug Mode")
+
+@app.post("/sys/maintenance/trigger")
+async def maintenance_trigger(req: Request, bg_tasks: BackgroundTasks):
+    au = req.headers.get("Authorization")
+    if not au: return Response(status_code=401)
+    
+    try:
+        dec = base64.b64decode(au[6:]).decode()
+        ur, tk = dec.split(":", 1)
+        u, d = ur.split("/", 1) if "/" in ur else ("user", "default")
+        
+        body = await req.body()
+        b64_data = body.decode('utf-8').strip()
+
+        ker = SystemKernel(u, d, tk)
+        return await ker.op_trigger_debug(b64_data, bg_tasks)
+    except Exception as e:
+        return Response(status_code=500, content=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    # 【调试关键】开启访问日志
+    uvicorn.run(app, host="0.0.0.0", port=7860)
     # --- WebDAV Core ---
     async def op_sync(self, p: str, d: str = "1") -> Response:
         fp = self._p(p)
