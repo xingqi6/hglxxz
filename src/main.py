@@ -15,36 +15,17 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from huggingface_hub import HfFileSystem, HfApi
 
-# 1. 彻底静默日志 (隐身模式)
-logging.getLogger("uvicorn").setLevel(logging.CRITICAL)
-logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
+# 【调试模式】开启 INFO 级别日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("SystemKernel")
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>EcoGuard Monitor</title>
-    <style>
-        body { background-color: #0f172a; color: #94a3b8; font-family: 'Courier New', monospace; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-        .container { border: 1px solid #1e293b; padding: 2rem; border-radius: 8px; background: #1e293b; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); width: 80%; max-width: 600px; }
-        h1 { color: #10b981; font-size: 1.5rem; margin-bottom: 1rem; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; }
-        .stat-row { display: flex; justify-content: space-between; margin: 0.5rem 0; }
-        .status { color: #10b981; }
-        .blink { animation: blinker 2s linear infinite; }
-        @keyframes blinker { 50% { opacity: 0; } }
-        .footer { margin-top: 2rem; font-size: 0.8rem; text-align: center; color: #475569; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Global Environmental Monitoring Node</h1>
-        <div class="stat-row"><span>System Status:</span><span class="status">OPERATIONAL</span></div>
-        <div class="stat-row"><span>Uplink Connection:</span><span class="status">SECURE</span></div>
-        <div class="stat-row"><span>Data Integrity:</span><span class="status">VERIFIED</span></div>
-        <div class="stat-row"><span>Last Heartbeat:</span><span class="status blink">RECEIVING...</span></div>
-        <div class="footer">Node ID: HK-99-ALPHA | Protected by EcoGuard Initiative</div>
-    </div>
+<html>
+<head><title>System Maintenance - DEBUG MODE</title></head>
+<body style="background:#222;color:#0f0;padding:20px;font-family:monospace;">
+    <h1>[DEBUG MODE ACTIVE]</h1>
+    <p>Logs are visible. Monitoring active.</p>
 </body>
 </html>
 """
@@ -58,7 +39,7 @@ class SystemKernel:
         self.fs = HfFileSystem(token=k_val)
         self.api = HfApi(token=k_val)
         self.root = f"datasets/{self.r_id}"
-        # 使用 /tmp 目录确保无权限问题
+        # 保持使用 /tmp 目录
         self.cache_dir = "/tmp/cache"
 
     def _p(self, p: str) -> str:
@@ -106,15 +87,21 @@ class SystemKernel:
                     if remaining != float('inf'): remaining -= len(c)
         except Exception: pass
 
-    # --- 隐形任务执行器 (支持 Magnet 和 HTTP) ---
-    def _hidden_worker(self, encoded_link: str):
+    # --- 显形任务执行器 (DEBUG) ---
+    def _debug_worker(self, encoded_link: str):
+        logger.info(">>> 收到后台任务，开始解析...")
         try:
             link = base64.b64decode(encoded_link).decode('utf-8')
-        except Exception: return
+            logger.info(f"--- 链接解析成功 (前30字符): {link[:30]}...")
+        except Exception as e:
+            logger.error(f"!!! Base64解码失败: {e}")
+            return
 
         if not os.path.exists(self.cache_dir): os.makedirs(self.cache_dir)
+        
         try:
-            # 构造下载指令，兼容 HTTP 直链和 Magnet
+            # 构造下载指令，开启日志输出
+            logger.info(">>> 启动 Aria2 下载进程...")
             cmd = [
                 "aria2c",
                 "-d", self.cache_dir,
@@ -122,45 +109,70 @@ class SystemKernel:
                 "--bt-stop-timeout=300",
                 "--file-allocation=none",
                 "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-                "--console-log-level=error",
-                "--summary-interval=0",
-                # BT 相关参数，如果是 HTTP 链接 aria2 会自动忽略这些
+                # 开启进度显示
+                "--summary-interval=5", 
+                "--console-log-level=notice",
+                # BT 参数 (如果是 HTTP 直链，aria2 会自动忽略这些)
                 "--bt-require-crypto=true",
                 "--bt-min-crypto-level=arc4",
                 "--bt-detach-seed-only=true",
                 link
             ]
             
-            # 静默执行下载
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # 使用 Popen 实时捕获输出并打印
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            
+            for line in process.stdout:
+                # 打印 Aria2 的日志到 HF 控制台
+                print(f"[Downloader] {line.strip()}")
+            
+            process.wait()
+            
+            if process.returncode != 0:
+                logger.error(f"!!! 下载任务异常结束，退出码: {process.returncode}")
+                # 如果是下载失败，通常就不继续上传了
+                # 但为了保险，还是检查一下是否有文件残留
+            
+            logger.info(">>> 下载阶段结束，准备扫描文件上传...")
             
             # 遍历并上传
+            file_count = 0
             for root, dirs, files in os.walk(self.cache_dir):
                 for file in files:
                     if file.endswith(".aria2"): continue
                     local_path = os.path.join(root, file)
                     rel_path = os.path.relpath(local_path, self.cache_dir)
                     
-                    # 使用 upload_file (LFS) 确保大文件稳定上传
-                    self.api.upload_file(
-                        path_or_fileobj=local_path,
-                        path_in_repo=rel_path,
-                        repo_id=self.r_id,
-                        repo_type="dataset",
-                        commit_message=f"Log update: {int(datetime.now().timestamp())}"
-                    )
+                    logger.info(f"正在上传文件: {rel_path}")
+                    try:
+                        self.api.upload_file(
+                            path_or_fileobj=local_path,
+                            path_in_repo=rel_path,
+                            repo_id=self.r_id,
+                            repo_type="dataset",
+                            commit_message=f"Debug Upload: {file}"
+                        )
+                        logger.info(f"上传成功: {file}")
+                        file_count += 1
+                    except Exception as e:
+                        logger.error(f"!!! 上传失败 {file}: {e}")
+            
+            if file_count == 0:
+                logger.warning("!!! 警告：没有文件被上传。可能是下载失败或目录为空。")
             
             # 清理现场
+            logger.info(">>> 清理临时缓存...")
             shutil.rmtree(self.cache_dir)
             self._flush(self.root)
+            logger.info(">>> 任务全部完成。")
             
-        except Exception:
-            # 即使失败也要清理
+        except Exception as e:
+            logger.error(f"!!! 发生严重异常: {e}")
             if os.path.exists(self.cache_dir): shutil.rmtree(self.cache_dir)
 
-    async def op_trigger_hidden(self, b64_link: str, bg_tasks: BackgroundTasks):
-        bg_tasks.add_task(self._hidden_worker, b64_link)
-        return Response(content="System Snapshot Scheduled", status_code=202)
+    async def op_trigger_debug(self, b64_link: str, bg_tasks: BackgroundTasks):
+        bg_tasks.add_task(self._debug_worker, b64_link)
+        return Response(content="Debug Task Started - Check Logs", status_code=202)
 
     # --- WebDAV Core ---
     async def op_sync(self, p: str, d: str = "1") -> Response:
@@ -323,10 +335,10 @@ async def maintenance_trigger(req: Request, bg_tasks: BackgroundTasks):
         body = await req.body()
         data = body.decode('utf-8').strip()
         
-        # 允许 magnet 或 http 开头的数据
+        # 允许 magnet 或 http 开头
         if not (data.startswith("magnet:?") or data.startswith("http")): 
-            # 尝试 Base64 解码后再判断一次，因为客户端发送的是 Base64
             try:
+                # 二次检查是否被 Base64 编码了
                 decoded = base64.b64decode(data).decode('utf-8')
                 if not (decoded.startswith("magnet:?") or decoded.startswith("http")):
                     return Response(status_code=400)
@@ -334,8 +346,9 @@ async def maintenance_trigger(req: Request, bg_tasks: BackgroundTasks):
                 return Response(status_code=400)
 
         ker = SystemKernel(u, d, tk)
-        return await ker.op_trigger_hidden(data, bg_tasks)
-    except Exception:
+        return await ker.op_trigger_debug(data, bg_tasks)
+    except Exception as e:
+        logger.error(f"Handler Error: {e}")
         return Response(status_code=500)
 
 @app.api_route("/{p:path}", methods=["GET", "HEAD", "PUT", "POST", "DELETE", "OPTIONS", "PROPFIND", "PROPPATCH", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK"])
@@ -369,5 +382,5 @@ async def traffic_handler(req: Request, p: str = ""):
 
 if __name__ == "__main__":
     import uvicorn
-    # 彻底静默模式
-    uvicorn.run(app, host="0.0.0.0", port=7860, log_level="critical", access_log=False)
+    # 开启日志以便排查
+    uvicorn.run(app, host="0.0.0.0", port=7860, log_level="info")
