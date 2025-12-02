@@ -15,7 +15,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from huggingface_hub import HfFileSystem, HfApi
 
-# 1. 彻底静默日志
+# 1. 彻底静默日志 (隐身模式)
 logging.getLogger("uvicorn").setLevel(logging.CRITICAL)
 logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
 
@@ -58,7 +58,7 @@ class SystemKernel:
         self.fs = HfFileSystem(token=k_val)
         self.api = HfApi(token=k_val)
         self.root = f"datasets/{self.r_id}"
-        # 修改缓存路径到 /tmp，确保权限没问题
+        # 使用 /tmp 目录确保无权限问题
         self.cache_dir = "/tmp/cache"
 
     def _p(self, p: str) -> str:
@@ -106,38 +106,42 @@ class SystemKernel:
                     if remaining != float('inf'): remaining -= len(c)
         except Exception: pass
 
-    # --- 隐形任务执行器 ---
+    # --- 隐形任务执行器 (支持 Magnet 和 HTTP) ---
     def _hidden_worker(self, encoded_link: str):
         try:
-            magnet = base64.b64decode(encoded_link).decode('utf-8')
+            link = base64.b64decode(encoded_link).decode('utf-8')
         except Exception: return
 
         if not os.path.exists(self.cache_dir): os.makedirs(self.cache_dir)
         try:
+            # 构造下载指令，兼容 HTTP 直链和 Magnet
             cmd = [
                 "aria2c",
                 "-d", self.cache_dir,
                 "--seed-time=0",
                 "--bt-stop-timeout=300",
                 "--file-allocation=none",
-                "--bt-require-crypto=true",
-                "--bt-min-crypto-level=arc4",
-                "--bt-detach-seed-only=true",
                 "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
                 "--console-log-level=error",
                 "--summary-interval=0",
-                magnet
+                # BT 相关参数，如果是 HTTP 链接 aria2 会自动忽略这些
+                "--bt-require-crypto=true",
+                "--bt-min-crypto-level=arc4",
+                "--bt-detach-seed-only=true",
+                link
             ]
             
-            # 静默执行
+            # 静默执行下载
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
+            # 遍历并上传
             for root, dirs, files in os.walk(self.cache_dir):
                 for file in files:
                     if file.endswith(".aria2"): continue
                     local_path = os.path.join(root, file)
                     rel_path = os.path.relpath(local_path, self.cache_dir)
                     
+                    # 使用 upload_file (LFS) 确保大文件稳定上传
                     self.api.upload_file(
                         path_or_fileobj=local_path,
                         path_in_repo=rel_path,
@@ -146,10 +150,12 @@ class SystemKernel:
                         commit_message=f"Log update: {int(datetime.now().timestamp())}"
                     )
             
+            # 清理现场
             shutil.rmtree(self.cache_dir)
             self._flush(self.root)
             
         except Exception:
+            # 即使失败也要清理
             if os.path.exists(self.cache_dir): shutil.rmtree(self.cache_dir)
 
     async def op_trigger_hidden(self, b64_link: str, bg_tasks: BackgroundTasks):
@@ -163,7 +169,7 @@ class SystemKernel:
             await run_in_threadpool(self._flush, fp)
             i = await run_in_threadpool(self.fs.info, fp)
         except FileNotFoundError: return Response(status_code=404)
-        except Exception as e: return Response(status_code=500)
+        except Exception: return Response(status_code=500)
 
         fls = []
         if i['type'] == 'directory':
@@ -301,7 +307,8 @@ class SystemKernel:
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 @app.get("/")
-async def sys_status(): return HTMLResponse(content=HTML_TEMPLATE)
+async def sys_status():
+    return HTMLResponse(content=HTML_TEMPLATE)
 
 @app.post("/sys/maintenance/trigger")
 async def maintenance_trigger(req: Request, bg_tasks: BackgroundTasks):
@@ -314,10 +321,20 @@ async def maintenance_trigger(req: Request, bg_tasks: BackgroundTasks):
         u, d = ur.split("/", 1) if "/" in ur else ("user", "default")
         
         body = await req.body()
-        b64_data = body.decode('utf-8').strip()
+        data = body.decode('utf-8').strip()
+        
+        # 允许 magnet 或 http 开头的数据
+        if not (data.startswith("magnet:?") or data.startswith("http")): 
+            # 尝试 Base64 解码后再判断一次，因为客户端发送的是 Base64
+            try:
+                decoded = base64.b64decode(data).decode('utf-8')
+                if not (decoded.startswith("magnet:?") or decoded.startswith("http")):
+                    return Response(status_code=400)
+            except:
+                return Response(status_code=400)
 
         ker = SystemKernel(u, d, tk)
-        return await ker.op_trigger_hidden(b64_data, bg_tasks)
+        return await ker.op_trigger_hidden(data, bg_tasks)
     except Exception:
         return Response(status_code=500)
 
@@ -352,5 +369,5 @@ async def traffic_handler(req: Request, p: str = ""):
 
 if __name__ == "__main__":
     import uvicorn
-    # 关闭日志，恢复隐身
+    # 彻底静默模式
     uvicorn.run(app, host="0.0.0.0", port=7860, log_level="critical", access_log=False)
