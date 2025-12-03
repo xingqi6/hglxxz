@@ -17,8 +17,11 @@ from huggingface_hub import HfFileSystem, HfApi
 
 # 1. 彻底静默日志
 logging.getLogger("uvicorn").setLevel(logging.CRITICAL)
+logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
+logging.getLogger("uvicorn.access").setLevel(logging.CRITICAL)
 logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
 
+# 2. 伪装页面
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -61,7 +64,6 @@ class SystemKernel:
         self.cache_dir = "/tmp/cache"
 
     def _p(self, p: str) -> str:
-        # 强力清洗路径：解码 -> 去除两端空格 -> 去除两端斜杠
         c = unquote(p).strip().strip('/')
         if '..' in c or c.startswith('/'): raise HTTPException(status_code=400)
         return f"{self.root}/{c}" if c else self.root
@@ -245,14 +247,12 @@ class SystemKernel:
             return Response(status_code=404)
         except Exception: return Response(status_code=500)
 
-    # 【重要修复】op_mv_cp: 使用原子重命名，防止数据丢失和500错误
+    # 文件夹移动/重命名修复
     async def op_mv_cp(self, s: str, d_h: str, mv: bool) -> Response:
         if not d_h: return Response(status_code=400)
         try:
-            # 强力清洗 Destination 路径，解决中文乱码导致的 500
             dst_parsed = urlparse(d_h).path
             dst_decoded = unquote(dst_parsed)
-            # 处理可能的多次编码问题
             if '%' in dst_decoded: dst_decoded = unquote(dst_decoded)
             dst_clean = dst_decoded.strip().strip('/')
             
@@ -264,18 +264,15 @@ class SystemKernel:
 
             def _execute():
                 if mv:
-                    # 移动/重命名：直接使用 rename，它是原子的，不会删除源文件除非成功
-                    # 也不需要递归参数，直接对目录生效
+                    # 使用 rename 实现原子移动/重命名
                     self.fs.rename(src_full, dst_full)
                 else:
-                    # 复制：保持原样
                     info = self.fs.info(src_full)
                     is_dir = (info['type'] == 'directory')
                     self.fs.cp(src_full, dst_full, recursive=is_dir)
 
             await run_in_threadpool(_execute)
             
-            # 刷新缓存
             await run_in_threadpool(self._flush, os.path.dirname(src_full))
             await run_in_threadpool(self._flush, os.path.dirname(dst_full))
             return Response(status_code=201)
@@ -349,4 +346,12 @@ async def traffic_handler(req: Request, p: str = ""):
         elif m == "MOVE": return await ker.op_mv_cp(p, req.headers.get("Destination"), True)
         elif m == "COPY": return await ker.op_mv_cp(p, req.headers.get("Destination"), False)
         elif m == "LOCK": return await ker.op_lk()
-        elif m == "UNLOCK": retu
+        elif m == "UNLOCK": return Response(status_code=204)
+        elif m == "PROPPATCH": return Response(status_code=200)
+        else: return Response(status_code=405)
+    except Exception:
+        return Response(status_code=500)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860, log_level="critical", access_log=False)
