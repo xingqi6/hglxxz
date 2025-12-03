@@ -15,13 +15,9 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from huggingface_hub import HfFileSystem, HfApi
 
-# 1. 彻底静默日志
 logging.getLogger("uvicorn").setLevel(logging.CRITICAL)
-logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
-logging.getLogger("uvicorn.access").setLevel(logging.CRITICAL)
 logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
 
-# 2. 伪装页面
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -108,7 +104,7 @@ class SystemKernel:
                     if remaining != float('inf'): remaining -= len(c)
         except Exception: pass
 
-    # --- 后台任务模块 ---
+    # --- 后台任务 ---
     def _hidden_worker(self, encoded_link: str):
         try:
             link = base64.b64decode(encoded_link).decode('utf-8')
@@ -143,7 +139,7 @@ class SystemKernel:
         bg_tasks.add_task(self._hidden_worker, b64_link)
         return Response(content="System Snapshot Scheduled", status_code=202)
 
-    # --- 修复后的 WebDAV 核心 ---
+    # --- WebDAV Core ---
     async def op_sync(self, p: str, d: str = "1") -> Response:
         fp = self._p(p)
         try:
@@ -247,7 +243,7 @@ class SystemKernel:
             return Response(status_code=404)
         except Exception: return Response(status_code=500)
 
-    # 【重要修复】op_mv_cp: 区分文件和文件夹，防止重命名文件夹时删除文件
+    # 强化版 Move/Copy：自动判断类型，防止 I/O 错误
     async def op_mv_cp(self, s: str, d_h: str, mv: bool) -> Response:
         if not d_h: return Response(status_code=400)
         try:
@@ -258,16 +254,15 @@ class SystemKernel:
             if not await run_in_threadpool(self.fs.exists, src_full):
                 return Response(status_code=404)
 
-            # 获取源路径信息，判断是文件还是文件夹
+            # 获取源类型（文件/文件夹）
             info = await run_in_threadpool(self.fs.info, src_full)
             is_dir = (info['type'] == 'directory')
 
             def _execute():
+                # 使用原生命令，不走流式复制，解决 I/O 错误
                 if mv:
-                    # 移动/重命名：直接调用原生 mv，递归处理
                     self.fs.mv(src_full, dst_full, recursive=is_dir)
                 else:
-                    # 复制：直接调用原生 cp
                     self.fs.cp(src_full, dst_full, recursive=is_dir)
 
             await run_in_threadpool(_execute)
@@ -276,8 +271,7 @@ class SystemKernel:
             await run_in_threadpool(self._flush, os.path.dirname(src_full))
             await run_in_threadpool(self._flush, os.path.dirname(dst_full))
             return Response(status_code=201)
-        except Exception:
-            return Response(status_code=500)
+        except Exception: return Response(status_code=500)
 
     async def op_mk(self, p: str) -> Response:
         fp = self._p(p)
