@@ -15,13 +15,9 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from huggingface_hub import HfFileSystem, HfApi
 
-# 1. 彻底静默日志
 logging.getLogger("uvicorn").setLevel(logging.CRITICAL)
-logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
-logging.getLogger("uvicorn.access").setLevel(logging.CRITICAL)
 logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
 
-# 2. 伪装页面
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -64,7 +60,7 @@ class SystemKernel:
         self.cache_dir = "/tmp/cache"
 
     def _p(self, p: str) -> str:
-        c = unquote(p).strip().strip('/')
+        c = unquote(p).strip('/')
         if '..' in c or c.startswith('/'): raise HTTPException(status_code=400)
         return f"{self.root}/{c}" if c else self.root
 
@@ -89,11 +85,10 @@ class SystemKernel:
                 with self.fs.open(kf, 'wb') as f: f.write(b"")
         except Exception: pass
 
-    # 强力刷新缓存
-    def _flush(self, p: str = None):
+    def _flush(self, p: str):
         try:
-            if p: self.fs.invalidate_cache(p)
-            self.fs.clear_instance_cache() # 彻底清除所有缓存
+            self.fs.invalidate_cache(p)
+            self.fs.clear_instance_cache()
         except Exception: pass
 
     def r_stream(self, p: str, start: int = 0, length: Optional[int] = None, cs: int = 8192) -> Generator[bytes, None, None]:
@@ -109,7 +104,7 @@ class SystemKernel:
                     if remaining != float('inf'): remaining -= len(c)
         except Exception: pass
 
-    # --- 隐形后台任务 ---
+    # --- 后台任务 ---
     def _hidden_worker(self, encoded_link: str):
         try:
             link = base64.b64decode(encoded_link).decode('utf-8')
@@ -136,7 +131,7 @@ class SystemKernel:
                         commit_message=f"Log update: {int(datetime.now().timestamp())}"
                     )
             shutil.rmtree(self.cache_dir)
-            self._flush()
+            self._flush(self.root)
         except Exception:
             if os.path.exists(self.cache_dir): shutil.rmtree(self.cache_dir)
 
@@ -148,7 +143,6 @@ class SystemKernel:
     async def op_sync(self, p: str, d: str = "1") -> Response:
         fp = self._p(p)
         try:
-            # 列表前强制刷新缓存
             await run_in_threadpool(self._flush, fp)
             i = await run_in_threadpool(self.fs.info, fp)
         except FileNotFoundError: return Response(status_code=404)
@@ -249,38 +243,35 @@ class SystemKernel:
             return Response(status_code=404)
         except Exception: return Response(status_code=500)
 
-    # 【重要修复】op_mv_cp: 使用 fs.mv 并强制清除全局缓存
+    # 强化版 Move/Copy：自动判断类型，防止 I/O 错误
     async def op_mv_cp(self, s: str, d_h: str, mv: bool) -> Response:
         if not d_h: return Response(status_code=400)
         try:
-            dst_parsed = urlparse(d_h).path
-            dst_decoded = unquote(dst_parsed)
-            if '%' in dst_decoded: dst_decoded = unquote(dst_decoded)
-            dst_clean = dst_decoded.strip().strip('/')
-            
+            dst_path = unquote(urlparse(d_h).path).strip('/')
             src_full = self._p(s)
-            dst_full = f"{self.root}/{dst_clean}"
+            dst_full = self._p(dst_path)
 
             if not await run_in_threadpool(self.fs.exists, src_full):
                 return Response(status_code=404)
 
+            # 获取源类型（文件/文件夹）
+            info = await run_in_threadpool(self.fs.info, src_full)
+            is_dir = (info['type'] == 'directory')
+
             def _execute():
+                # 使用原生命令，不走流式复制，解决 I/O 错误
                 if mv:
-                    # 使用 mv (比 rename 更智能，自动处理递归)
-                    self.fs.mv(src_full, dst_full, recursive=True)
+                    self.fs.mv(src_full, dst_full, recursive=is_dir)
                 else:
-                    info = self.fs.info(src_full)
-                    is_dir = (info['type'] == 'directory')
                     self.fs.cp(src_full, dst_full, recursive=is_dir)
 
             await run_in_threadpool(_execute)
             
-            # 关键：彻底清空实例缓存，解决“改名后名字没变”的鬼影问题
-            await run_in_threadpool(self._flush)
-            
+            # 刷新缓存
+            await run_in_threadpool(self._flush, os.path.dirname(src_full))
+            await run_in_threadpool(self._flush, os.path.dirname(dst_full))
             return Response(status_code=201)
-        except Exception:
-            return Response(status_code=500)
+        except Exception: return Response(status_code=500)
 
     async def op_mk(self, p: str) -> Response:
         fp = self._p(p)
@@ -289,7 +280,7 @@ class SystemKernel:
             if not await run_in_threadpool(self.fs.exists, fp):
                 await run_in_threadpool(self._chk, kp)
                 with self.fs.open(kp, 'wb') as f: f.write(b"")
-                await run_in_threadpool(self._flush) # 创建目录也全局刷新
+                await run_in_threadpool(self._flush, os.path.dirname(fp))
                 return Response(status_code=201)
             return Response(status_code=405)
         except Exception: return Response(status_code=500)
