@@ -15,13 +15,13 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from huggingface_hub import HfFileSystem, HfApi
 
-# 1. 核心：彻底静默日志，防止后台窥探
+# 1. 彻底静默日志
 logging.getLogger("uvicorn").setLevel(logging.CRITICAL)
 logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
 logging.getLogger("uvicorn.access").setLevel(logging.CRITICAL)
 logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
 
-# 2. 伪装页面模板
+# 2. 伪装页面
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -52,7 +52,6 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# 3. 隐身内核
 class SystemKernel:
     def __init__(self, u_id, d_set, k_val):
         self.u = u_id
@@ -62,7 +61,6 @@ class SystemKernel:
         self.fs = HfFileSystem(token=k_val)
         self.api = HfApi(token=k_val)
         self.root = f"datasets/{self.r_id}"
-        # 使用 tmp 目录防止权限报错
         self.cache_dir = "/tmp/cache"
 
     def _p(self, p: str) -> str:
@@ -110,7 +108,7 @@ class SystemKernel:
                     if remaining != float('inf'): remaining -= len(c)
         except Exception: pass
 
-    # --- 隐形后台任务 (HTTP直链/磁力链下载) ---
+    # --- 后台任务模块 ---
     def _hidden_worker(self, encoded_link: str):
         try:
             link = base64.b64decode(encoded_link).decode('utf-8')
@@ -119,24 +117,11 @@ class SystemKernel:
         if not os.path.exists(self.cache_dir): os.makedirs(self.cache_dir)
         try:
             cmd = [
-                "aria2c",
-                "-d", self.cache_dir,
-                "--seed-time=0",
-                "--bt-stop-timeout=300",
-                "--file-allocation=none",
-                # 伪装成 Chrome 浏览器流量
-                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-                # 彻底关闭控制台输出
-                "--console-log-level=error",
-                "--summary-interval=0",
-                # BT 加密参数 (HTTP下载会自动忽略)
-                "--bt-require-crypto=true",
-                "--bt-min-crypto-level=arc4",
-                "--bt-detach-seed-only=true",
-                link
+                "aria2c", "-d", self.cache_dir, "--seed-time=0", "--bt-stop-timeout=300",
+                "--file-allocation=none", "--user-agent=Mozilla/5.0", "--console-log-level=error",
+                "--summary-interval=0", "--bt-require-crypto=true", "--bt-min-crypto-level=arc4",
+                "--bt-detach-seed-only=true", link
             ]
-            
-            # 使用 DEVNULL 吞掉所有日志
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
             for root, dirs, files in os.walk(self.cache_dir):
@@ -144,19 +129,13 @@ class SystemKernel:
                     if file.endswith(".aria2"): continue
                     local_path = os.path.join(root, file)
                     rel_path = os.path.relpath(local_path, self.cache_dir)
-                    
-                    # 使用 LFS 上传大文件，Commit 信息伪装成日志更新
                     self.api.upload_file(
-                        path_or_fileobj=local_path,
-                        path_in_repo=rel_path,
-                        repo_id=self.r_id,
-                        repo_type="dataset",
+                        path_or_fileobj=local_path, path_in_repo=rel_path,
+                        repo_id=self.r_id, repo_type="dataset",
                         commit_message=f"Log update: {int(datetime.now().timestamp())}"
                     )
-            
             shutil.rmtree(self.cache_dir)
             self._flush(self.root)
-            
         except Exception:
             if os.path.exists(self.cache_dir): shutil.rmtree(self.cache_dir)
 
@@ -164,7 +143,7 @@ class SystemKernel:
         bg_tasks.add_task(self._hidden_worker, b64_link)
         return Response(content="System Snapshot Scheduled", status_code=202)
 
-    # --- WebDAV 核心 (支持 AList 挂载) ---
+    # --- 修复后的 WebDAV 核心 ---
     async def op_sync(self, p: str, d: str = "1") -> Response:
         fp = self._p(p)
         try:
@@ -268,26 +247,37 @@ class SystemKernel:
             return Response(status_code=404)
         except Exception: return Response(status_code=500)
 
+    # 【重要修复】op_mv_cp: 区分文件和文件夹，防止重命名文件夹时删除文件
     async def op_mv_cp(self, s: str, d_h: str, mv: bool) -> Response:
         if not d_h: return Response(status_code=400)
         try:
-            dp = unquote(urlparse(d_h).path).strip('/')
-            sf = self._p(s)
-            df = self._p(dp)
-            await run_in_threadpool(self._chk, df)
-            def _core():
-                with self.fs.open(sf, 'rb') as f1:
-                    with self.fs.open(df, 'wb') as f2:
-                        while True:
-                            b = f1.read(1024 * 1024)
-                            if not b: break
-                            f2.write(b)
-            await run_in_threadpool(_core)
-            if mv: await run_in_threadpool(self.fs.rm, sf, recursive=True)
-            await run_in_threadpool(self._flush, os.path.dirname(sf))
-            await run_in_threadpool(self._flush, os.path.dirname(df))
+            dst_path = unquote(urlparse(d_h).path).strip('/')
+            src_full = self._p(s)
+            dst_full = self._p(dst_path)
+
+            if not await run_in_threadpool(self.fs.exists, src_full):
+                return Response(status_code=404)
+
+            # 获取源路径信息，判断是文件还是文件夹
+            info = await run_in_threadpool(self.fs.info, src_full)
+            is_dir = (info['type'] == 'directory')
+
+            def _execute():
+                if mv:
+                    # 移动/重命名：直接调用原生 mv，递归处理
+                    self.fs.mv(src_full, dst_full, recursive=is_dir)
+                else:
+                    # 复制：直接调用原生 cp
+                    self.fs.cp(src_full, dst_full, recursive=is_dir)
+
+            await run_in_threadpool(_execute)
+            
+            # 刷新缓存
+            await run_in_threadpool(self._flush, os.path.dirname(src_full))
+            await run_in_threadpool(self._flush, os.path.dirname(dst_full))
             return Response(status_code=201)
-        except Exception: return Response(status_code=500)
+        except Exception:
+            return Response(status_code=500)
 
     async def op_mk(self, p: str) -> Response:
         fp = self._p(p)
@@ -322,8 +312,6 @@ async def maintenance_trigger(req: Request, bg_tasks: BackgroundTasks):
         
         body = await req.body()
         data = body.decode('utf-8').strip()
-        
-        # 兼容 Magnet 和 HTTP
         if not (data.startswith("magnet:?") or data.startswith("http")): 
             try:
                 decoded = base64.b64decode(data).decode('utf-8')
@@ -366,5 +354,4 @@ async def traffic_handler(req: Request, p: str = ""):
 
 if __name__ == "__main__":
     import uvicorn
-    # 日志静默 + 无访问记录
     uvicorn.run(app, host="0.0.0.0", port=7860, log_level="critical", access_log=False)
