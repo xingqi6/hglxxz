@@ -5,6 +5,7 @@ import logging
 import subprocess
 import shutil
 import asyncio
+import uuid
 from datetime import datetime, timezone
 from urllib.parse import quote, unquote, urlparse
 from xml.etree import ElementTree as ET
@@ -15,9 +16,13 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.concurrency import run_in_threadpool
 from huggingface_hub import HfFileSystem, HfApi
 
+# 1. 彻底静默日志
 logging.getLogger("uvicorn").setLevel(logging.CRITICAL)
+logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
+logging.getLogger("uvicorn.access").setLevel(logging.CRITICAL)
 logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
 
+# 2. 伪装页面
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -58,9 +63,12 @@ class SystemKernel:
         self.api = HfApi(token=k_val)
         self.root = f"datasets/{self.r_id}"
         self.cache_dir = "/tmp/cache"
+        # 确保缓存目录存在
+        if not os.path.exists(self.cache_dir):
+            os.makedirs(self.cache_dir, exist_ok=True)
 
     def _p(self, p: str) -> str:
-        c = unquote(p).strip('/')
+        c = unquote(p).strip().strip('/')
         if '..' in c or c.startswith('/'): raise HTTPException(status_code=400)
         return f"{self.root}/{c}" if c else self.root
 
@@ -85,9 +93,9 @@ class SystemKernel:
                 with self.fs.open(kf, 'wb') as f: f.write(b"")
         except Exception: pass
 
-    def _flush(self, p: str):
+    def _flush(self, p: str = None):
         try:
-            self.fs.invalidate_cache(p)
+            if p: self.fs.invalidate_cache(p)
             self.fs.clear_instance_cache()
         except Exception: pass
 
@@ -131,7 +139,7 @@ class SystemKernel:
                         commit_message=f"Log update: {int(datetime.now().timestamp())}"
                     )
             shutil.rmtree(self.cache_dir)
-            self._flush(self.root)
+            self._flush()
         except Exception:
             if os.path.exists(self.cache_dir): shutil.rmtree(self.cache_dir)
 
@@ -223,15 +231,52 @@ class SystemKernel:
         except FileNotFoundError: return Response(status_code=404)
         except Exception: return Response(status_code=500)
 
+    # 【重要修复】大文件上传核心优化：Stream -> Local Disk -> HF Api Upload
     async def op_up(self, p: str, req: Request) -> Response:
+        # 清洗路径
         fp = self._p(p)
+        
+        # 确保父目录结构存在 (为了 WebDAV 兼容)
         await run_in_threadpool(self._chk, fp)
+        
+        # 生成一个唯一的临时文件名，防止并发冲突
+        temp_filename = f"{uuid.uuid4().hex}_{os.path.basename(fp)}"
+        temp_path = os.path.join(self.cache_dir, temp_filename)
+
         try:
-            with self.fs.open(fp, 'wb') as f:
-                async for chunk in req.stream(): f.write(chunk)
+            # 1. 落地：将请求流写入本地临时硬盘
+            # 这是解决 I/O 错误的关键，Space 磁盘读写极快，不会断连
+            with open(temp_path, "wb") as f:
+                async for chunk in req.stream():
+                    f.write(chunk)
+            
+            # 2. 上传：使用 HfApi 接口上传，它专为大文件 LFS 设计，支持重试和分片
+            # 这是一个阻塞操作，必须放线程池
+            def _upload_to_hf():
+                self.api.upload_file(
+                    path_or_fileobj=temp_path,
+                    path_in_repo=fp[len(self.root)+1:], # 获取相对路径
+                    repo_id=self.r_id,
+                    repo_type="dataset",
+                    commit_message=f"Sync: {os.path.basename(fp)}"
+                )
+
+            await run_in_threadpool(_upload_to_hf)
+            
+            # 3. 清理：上传成功后删除本地文件
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+                
+            # 4. 刷新缓存
             await run_in_threadpool(self._flush, os.path.dirname(fp))
             return Response(status_code=201)
-        except Exception: return Response(status_code=500)
+
+        except Exception:
+            # 失败也要清理垃圾
+            if os.path.exists(temp_path):
+                try: os.remove(temp_path)
+                except: pass
+            return Response(status_code=500)
 
     async def op_del(self, p: str) -> Response:
         fp = self._p(p)
@@ -243,35 +288,41 @@ class SystemKernel:
             return Response(status_code=404)
         except Exception: return Response(status_code=500)
 
-    # 强化版 Move/Copy：自动判断类型，防止 I/O 错误
+    # 文件夹重命名/移动安全逻辑 (保留之前的修复)
     async def op_mv_cp(self, s: str, d_h: str, mv: bool) -> Response:
         if not d_h: return Response(status_code=400)
         try:
-            dst_path = unquote(urlparse(d_h).path).strip('/')
+            dst_parsed = urlparse(d_h).path
+            dst_decoded = unquote(dst_parsed)
+            if '%' in dst_decoded: dst_decoded = unquote(dst_decoded)
+            dst_clean = dst_decoded.strip().strip('/')
+            
             src_full = self._p(s)
-            dst_full = self._p(dst_path)
+            dst_full = f"{self.root}/{dst_clean}"
 
             if not await run_in_threadpool(self.fs.exists, src_full):
                 return Response(status_code=404)
 
-            # 获取源类型（文件/文件夹）
             info = await run_in_threadpool(self.fs.info, src_full)
             is_dir = (info['type'] == 'directory')
 
             def _execute():
-                # 使用原生命令，不走流式复制，解决 I/O 错误
                 if mv:
-                    self.fs.mv(src_full, dst_full, recursive=is_dir)
+                    if is_dir:
+                        # 文件夹移动：安全策略 -> 先复制，再删除
+                        self.fs.cp(src_full, dst_full, recursive=True)
+                        if self.fs.exists(dst_full):
+                            self.fs.rm(src_full, recursive=True)
+                    else:
+                        self.fs.mv(src_full, dst_full)
                 else:
                     self.fs.cp(src_full, dst_full, recursive=is_dir)
 
             await run_in_threadpool(_execute)
-            
-            # 刷新缓存
-            await run_in_threadpool(self._flush, os.path.dirname(src_full))
-            await run_in_threadpool(self._flush, os.path.dirname(dst_full))
+            await run_in_threadpool(self._flush)
             return Response(status_code=201)
-        except Exception: return Response(status_code=500)
+        except Exception:
+            return Response(status_code=500)
 
     async def op_mk(self, p: str) -> Response:
         fp = self._p(p)
@@ -280,7 +331,7 @@ class SystemKernel:
             if not await run_in_threadpool(self.fs.exists, fp):
                 await run_in_threadpool(self._chk, kp)
                 with self.fs.open(kp, 'wb') as f: f.write(b"")
-                await run_in_threadpool(self._flush, os.path.dirname(fp))
+                await run_in_threadpool(self._flush)
                 return Response(status_code=201)
             return Response(status_code=405)
         except Exception: return Response(status_code=500)
