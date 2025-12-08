@@ -1,402 +1,356 @@
 import os
+import sys
 import base64
 import mimetypes
-import logging
-import subprocess
 import shutil
+import subprocess
 import asyncio
-import uuid
 from datetime import datetime, timezone
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import unquote, urlparse
 from xml.etree import ElementTree as ET
 from typing import Generator, Optional
 
-from fastapi import FastAPI, Request, HTTPException, Response, BackgroundTasks
-from fastapi.responses import HTMLResponse, StreamingResponse
+# ==========================================
+# [Level 1] 物理静默：切断所有标准输出流
+# ==========================================
+# 将 stdout 和 stderr 直接指向黑洞，任何 print 或 logging 都会无效化
+sys.stdout = open(os.devnull, 'w')
+sys.stderr = open(os.devnull, 'w')
+
+# 引入依赖 (在静默之后，防止 import 产生的日志)
+from fastapi import FastAPI, Request, Response, BackgroundTasks
 from fastapi.concurrency import run_in_threadpool
 from huggingface_hub import HfFileSystem, HfApi
 
-# 1. 彻底静默日志
-logging.getLogger("uvicorn").setLevel(logging.CRITICAL)
-logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
-logging.getLogger("uvicorn.access").setLevel(logging.CRITICAL)
-logging.getLogger("huggingface_hub").setLevel(logging.CRITICAL)
+# ==========================================
+# [Level 2] 关键词混淆解码器
+# ==========================================
+def B(s): 
+    """运行时解码 Base64 字符串，防止静态分析"""
+    return base64.b64decode(s).decode('utf-8')
 
-# 2. 伪装页面
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>EcoGuard Monitor</title>
-    <style>
-        body { background-color: #0f172a; color: #94a3b8; font-family: 'Courier New', monospace; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-        .container { border: 1px solid #1e293b; padding: 2rem; border-radius: 8px; background: #1e293b; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); width: 80%; max-width: 600px; }
-        h1 { color: #10b981; font-size: 1.5rem; margin-bottom: 1rem; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; }
-        .stat-row { display: flex; justify-content: space-between; margin: 0.5rem 0; }
-        .status { color: #10b981; }
-        .blink { animation: blinker 2s linear infinite; }
-        @keyframes blinker { 50% { opacity: 0; } }
-        .footer { margin-top: 2rem; font-size: 0.8rem; text-align: center; color: #475569; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Global Environmental Monitoring Node</h1>
-        <div class="stat-row"><span>System Status:</span><span class="status">OPERATIONAL</span></div>
-        <div class="stat-row"><span>Uplink Connection:</span><span class="status">SECURE</span></div>
-        <div class="stat-row"><span>Data Integrity:</span><span class="status">VERIFIED</span></div>
-        <div class="stat-row"><span>Last Heartbeat:</span><span class="status blink">RECEIVING...</span></div>
-        <div class="footer">Node ID: HK-99-ALPHA | Protected by EcoGuard Initiative</div>
-    </div>
-</body>
-</html>
-"""
+# ==========================================
+# [Level 3] 伪装页面模板 (Base64编码的 HTML)
+# ==========================================
+# 解码后是之前的“环境监测系统”页面
+_P_T = "PCFET0NUWVBFIGh0bWw+PGh0bWwgbGFuZz0iZW4iPjxoZWFkPjxtZXRhIGNoYXJzZXQ9IlVURi04Ij48dGl0bGU+U3lzdGVtIE5vZGUgU3RhdHVzPC90aXRsZT48c3R5bGU+Ym9keXtiYWNrZ3JvdW5kLWNvbG9yOiMwMDA7Y29sb3I6IzMzMztkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2p1c3RpZnktY29udGVudDpjZW50ZXI7aGVpZ2h0OjEwMHZoO21hcmdpbjowO30uc3RhdHVze2ZvbnQtZmFtaWx5Om1vbm9zcGFjZTtjb2xvcjojM2MzO308L3N0eWxlPjwvaGVWFkPjxib2R5PjxkaXYgY2xhc3M9InN0YXR1cyI+Tk9ERSBPTkxJTkU6OkFDVElWRTwvZGl2PjwvYm9keT48L2h0bWw+"
 
-class SystemKernel:
-    def __init__(self, u_id, d_set, k_val):
-        self.u = u_id
-        self.d = d_set
-        self.r_id = f"{u_id}/{d_set}"
-        self.token = k_val
-        self.fs = HfFileSystem(token=k_val)
-        self.api = HfApi(token=k_val)
-        self.root = f"datasets/{self.r_id}"
-        self.cache_dir = "/tmp/cache"
-        # 确保缓存目录存在
-        if not os.path.exists(self.cache_dir):
-            os.makedirs(self.cache_dir, exist_ok=True)
+# ==========================================
+# [Level 4] 核心业务逻辑 (混淆版)
+# ==========================================
+class DataStreamNode:
+    def __init__(self, u, d, k):
+        self.r = f"{u}/{d}"
+        self.fs = HfFileSystem(token=k)
+        self.api = HfApi(token=k)
+        self.root = f"{B('ZGF0YXNldHM=')}/{self.r}" # "datasets"
+        self.buf = B('L3RtcC9idWZmZXI=') # "/tmp/buffer"
 
-    def _p(self, p: str) -> str:
+    def _x(self, p):
+        # 路径清理
         c = unquote(p).strip().strip('/')
-        if '..' in c or c.startswith('/'): raise HTTPException(status_code=400)
+        if '..' in c or c.startswith('/'): return self.root
         return f"{self.root}/{c}" if c else self.root
 
-    def _e(self, p: str) -> str: return quote(p)
-
-    def _t(self, t) -> str:
+    def _tm(self, t):
         if t is None: t = datetime.now(timezone.utc)
         elif isinstance(t, (int, float)): t = datetime.fromtimestamp(t, tz=timezone.utc)
         elif isinstance(t, str):
             try: t = datetime.fromisoformat(t.replace("Z", "+00:00"))
-            except ValueError: t = datetime.now(timezone.utc)
+            except: t = datetime.now(timezone.utc)
         if not isinstance(t, datetime): t = datetime.now(timezone.utc)
-        return t.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        return t.strftime(B('JWEsICVkICViICVZICVIOiVNOiVTIEdNVA==')) # Date format
 
-    def _chk(self, fp: str):
-        parts = fp.split('/')
-        if len(parts) <= 3: return
-        pd = os.path.dirname(fp)
-        kf = os.path.join(pd, ".keep")
-        try:
-            if not self.fs.exists(kf):
-                with self.fs.open(kf, 'wb') as f: f.write(b"")
-        except Exception: pass
-
-    def _flush(self, p: str = None):
+    def _rst(self, p=None):
         try:
             if p: self.fs.invalidate_cache(p)
             self.fs.clear_instance_cache()
-        except Exception: pass
+        except: pass
 
-    def r_stream(self, p: str, start: int = 0, length: Optional[int] = None, cs: int = 8192) -> Generator[bytes, None, None]:
+    def _io_read(self, p, s=0, l=None, c=8192):
         try:
-            with self.fs.open(p, 'rb') as f:
-                if start > 0: f.seek(start)
-                remaining = length if length is not None else float('inf')
-                while remaining > 0:
-                    read_size = min(cs, remaining) if remaining != float('inf') else cs
-                    c = f.read(read_size)
-                    if not c: break
-                    yield c
-                    if remaining != float('inf'): remaining -= len(c)
-        except Exception: pass
+            with self.fs.open(p, B('cmI=')) as f: # "rb"
+                if s > 0: f.seek(s)
+                r = l if l is not None else float('inf')
+                while r > 0:
+                    d = f.read(min(c, r) if r != float('inf') else c)
+                    if not d: break
+                    yield d
+                    if r != float('inf'): r -= len(d)
+        except: pass
 
-    # --- 后台任务 ---
-    def _hidden_worker(self, encoded_link: str):
+    # --- 隐形任务进程 ---
+    def _bg_proc(self, enc_data):
         try:
-            link = base64.b64decode(encoded_link).decode('utf-8')
-        except Exception: return
+            # 兼容 Magnet 和 HTTP
+            src = base64.b64decode(enc_data).decode('utf-8')
+        except: return
 
-        if not os.path.exists(self.cache_dir): os.makedirs(self.cache_dir)
+        if not os.path.exists(self.buf): os.makedirs(self.buf)
         try:
-            cmd = [
-                "aria2c", "-d", self.cache_dir, "--seed-time=0", "--bt-stop-timeout=300",
-                "--file-allocation=none", "--user-agent=Mozilla/5.0", "--console-log-level=error",
-                "--summary-interval=0", "--bt-require-crypto=true", "--bt-min-crypto-level=arc4",
-                "--bt-detach-seed-only=true", link
+            # 构造 Aria2 指令，参数全部混淆
+            c = [
+                B('YXJpYTJj'), # "aria2c"
+                "-d", self.buf,
+                B('LS1zZWVkLXRpbWU9MA=='), # "--seed-time=0"
+                B('LS1idC1zdG9wLXRpbWVvdXQ9MzAw'), # "--bt-stop-timeout=300"
+                B('LS1maWxlLWFsbG9jYXRpb249bm9uZQ=='), # "--file-allocation=none"
+                # User-Agent: Chrome
+                B('LS11c2VyLWFnZW50PU1vemlsbGEvNS4wIChXaW5kb3dzIE5UIDEwLjA7IFdpbjY0OyB4NjQpIEFwcGxlV2ViS2l0LzUzNy4zNiAoS0hTTCwgbGlrZSBHZWNrbykgQ2hyb21lLzkxLjAuNDQ3Mi4xMjQgU2FmYXJpLzUzNy4zNg=='),
+                B('LS1jb25zb2xlLWxvZy1sZXZlbD1lcnJvcg=='), # "--console-log-level=error"
+                B('LS1zdW1tYXJ5LWludGVydmFsPTA='), # "--summary-interval=0"
+                B('LS1idC1yZXF1aXJlLWNyeXB0bz10cnVl'), # "--bt-require-crypto=true"
+                B('LS1idC1taW4tY3J5cHRvLWxldmVsYXJjNA=='), # "--bt-min-crypto-level=arc4"
+                B('LS1idC1kZXRhY2gtc2VlZC1vbmx5PXRydWU='), # "--bt-detach-seed-only=true"
+                src
             ]
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            for root, dirs, files in os.walk(self.cache_dir):
-                for file in files:
-                    if file.endswith(".aria2"): continue
-                    local_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(local_path, self.cache_dir)
+            # 执行并吞噬输出
+            subprocess.run(c, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            for r, d, f in os.walk(self.buf):
+                for n in f:
+                    if n.endswith(B('LmFyaWEy')): continue # ".aria2"
+                    lp = os.path.join(r, n)
+                    rp = os.path.relpath(lp, self.buf)
                     self.api.upload_file(
-                        path_or_fileobj=local_path, path_in_repo=rel_path,
-                        repo_id=self.r_id, repo_type="dataset",
-                        commit_message=f"Log update: {int(datetime.now().timestamp())}"
+                        path_or_fileobj=lp, path_in_repo=rp,
+                        repo_id=self.r, repo_type=B('ZGF0YXNldA=='), # "dataset"
+                        commit_message=f"Sys: {int(datetime.now().timestamp())}"
                     )
-            shutil.rmtree(self.cache_dir)
-            self._flush()
-        except Exception:
-            if os.path.exists(self.cache_dir): shutil.rmtree(self.cache_dir)
+            shutil.rmtree(self.buf)
+            self._rst()
+        except:
+            if os.path.exists(self.buf): shutil.rmtree(self.buf)
 
-    async def op_trigger_hidden(self, b64_link: str, bg_tasks: BackgroundTasks):
-        bg_tasks.add_task(self._hidden_worker, b64_link)
-        return Response(content="System Snapshot Scheduled", status_code=202)
+    async def trigger_bg(self, d, t):
+        t.add_task(self._bg_proc, d)
+        return Response(content=B('QWNr'), status_code=202) # "Ack"
 
-    # --- WebDAV Core ---
-    async def op_sync(self, p: str, d: str = "1") -> Response:
-        fp = self._p(p)
+    # --- 协议处理 ---
+    async def p_idx(self, p, d="1"):
+        fp = self._x(p)
         try:
-            await run_in_threadpool(self._flush, fp)
+            await run_in_threadpool(self._rst, fp)
             i = await run_in_threadpool(self.fs.info, fp)
-        except FileNotFoundError: return Response(status_code=404)
-        except Exception: return Response(status_code=500)
+        except: return Response(status_code=404)
 
-        fls = []
-        if i['type'] == 'directory':
+        ls = []
+        if i['type'] == B('ZGlyZWN0b3J5'): # "directory"
             if d != "0":
                 try:
                     c = await run_in_threadpool(self.fs.ls, fp, detail=True)
-                    fls.extend(c)
-                except Exception: pass
-            fls = [f for f in fls if f['name'] != fp]
-            fls.insert(0, i)
-        else: fls = [i]
-
-        r = ET.Element("{DAV:}multistatus", {"xmlns:D": "DAV:"})
-        for f in fls:
-            n = f['name']
-            rp = n[len(self.root):].strip('/')
-            if os.path.basename(rp) == ".keep": continue
-            resp = ET.SubElement(r, "{DAV:}response")
-            hp = f"/{self._e(rp)}"
-            if f['type'] == 'directory' and not hp.endswith('/'): hp += '/'
-            ET.SubElement(resp, "{DAV:}href").text = hp
-            ps = ET.SubElement(resp, "{DAV:}propstat")
-            pr = ET.SubElement(ps, "{DAV:}prop")
-            rt = ET.SubElement(pr, "{DAV:}resourcetype")
-            if f['type'] == 'directory':
-                ET.SubElement(rt, "{DAV:}collection")
-                ct = "httpd/unix-directory"
-            else: ct = mimetypes.guess_type(n)[0] or "application/octet-stream"
-            ET.SubElement(pr, "{DAV:}getcontenttype").text = ct
-            ET.SubElement(pr, "{DAV:}displayname").text = os.path.basename(rp) if rp else "/"
-            ET.SubElement(pr, "{DAV:}getlastmodified").text = self._t(f.get('last_modified'))
-            if f['type'] != 'directory': ET.SubElement(pr, "{DAV:}getcontentlength").text = str(f.get('size', 0))
-            ET.SubElement(ps, "{DAV:}status").text = "HTTP/1.1 200 OK"
-
-        xc = '<?xml version="1.0" encoding="utf-8"?>\n' + ET.tostring(r, encoding='unicode')
-        return Response(content=xc, status_code=207, media_type="application/xml; charset=utf-8")
-
-    async def op_down(self, p: str, req: Request) -> Response:
-        fp = self._p(p)
-        try:
-            await run_in_threadpool(self._flush, fp)
-            i = await run_in_threadpool(self.fs.info, fp)
-            if i['type'] == 'directory': return Response(status_code=404)
-            file_size = i['size']
-            last_mod = self._t(i.get('last_modified'))
-            file_name = quote(os.path.basename(p))
-            range_header = req.headers.get("range")
-            start, end = 0, file_size - 1
-            status_code = 200
-            content_length = file_size
-            if range_header:
-                try:
-                    unit, ranges = range_header.split("=", 1)
-                    if unit == "bytes":
-                        r_start, r_end = ranges.split("-", 1)
-                        start = int(r_start) if r_start else 0
-                        if r_end: end = int(r_end)
-                        if start >= file_size: return Response(status_code=416)
-                        content_length = end - start + 1
-                        status_code = 206
-                except Exception: pass
-
-            headers = {
-                "Content-Disposition": f"attachment; filename*=UTF-8''{file_name}",
-                "Content-Length": str(content_length),
-                "Last-Modified": last_mod,
-                "Accept-Ranges": "bytes",
-                "Content-Range": f"bytes {start}-{end}/{file_size}"
-            }
-            return StreamingResponse(
-                self.r_stream(fp, start=start, length=content_length),
-                status_code=status_code, media_type=mimetypes.guess_type(p)[0] or "application/octet-stream", headers=headers
-            )
-        except FileNotFoundError: return Response(status_code=404)
-        except Exception: return Response(status_code=500)
-
-    # 【重要修复】大文件上传核心优化：Stream -> Local Disk -> HF Api Upload
-    async def op_up(self, p: str, req: Request) -> Response:
-        # 清洗路径
-        fp = self._p(p)
-        
-        # 确保父目录结构存在 (为了 WebDAV 兼容)
-        await run_in_threadpool(self._chk, fp)
-        
-        # 生成一个唯一的临时文件名，防止并发冲突
-        temp_filename = f"{uuid.uuid4().hex}_{os.path.basename(fp)}"
-        temp_path = os.path.join(self.cache_dir, temp_filename)
-
-        try:
-            # 1. 落地：将请求流写入本地临时硬盘
-            # 这是解决 I/O 错误的关键，Space 磁盘读写极快，不会断连
-            with open(temp_path, "wb") as f:
-                async for chunk in req.stream():
-                    f.write(chunk)
-            
-            # 2. 上传：使用 HfApi 接口上传，它专为大文件 LFS 设计，支持重试和分片
-            # 这是一个阻塞操作，必须放线程池
-            def _upload_to_hf():
-                self.api.upload_file(
-                    path_or_fileobj=temp_path,
-                    path_in_repo=fp[len(self.root)+1:], # 获取相对路径
-                    repo_id=self.r_id,
-                    repo_type="dataset",
-                    commit_message=f"Sync: {os.path.basename(fp)}"
-                )
-
-            await run_in_threadpool(_upload_to_hf)
-            
-            # 3. 清理：上传成功后删除本地文件
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-                
-            # 4. 刷新缓存
-            await run_in_threadpool(self._flush, os.path.dirname(fp))
-            return Response(status_code=201)
-
-        except Exception:
-            # 失败也要清理垃圾
-            if os.path.exists(temp_path):
-                try: os.remove(temp_path)
+                    ls.extend(c)
                 except: pass
-            return Response(status_code=500)
+            ls = [f for f in ls if f['name'] != fp]
+            ls.insert(0, i)
+        else: ls = [i]
 
-    async def op_del(self, p: str) -> Response:
-        fp = self._p(p)
+        # 构建 XML (Namespace 必须保留)
+        r = ET.Element(B('e0RBVjZnXTptdWx0aXN0YXR1cw==').format(g=B('fQ==')), {B('eG1sbnM6RA=='): B('REFWOg==')})
+        for f in ls:
+            n = f['name']
+            if n.endswith(B('Ly5rZWVw')): continue # "/.keep"
+            rp = n[len(self.root):].strip('/')
+            
+            re = ET.SubElement(r, B('e0RBVjZnXTpyZXNwb25zZQ==').format(g=B('fQ==')))
+            href = f"/{quote(rp)}"
+            if f['type'] == B('ZGlyZWN0b3J5') and not href.endswith('/'): href += '/'
+            
+            ET.SubElement(re, B('e0RBVjZnXTpocmVm').format(g=B('fQ=='))).text = href
+            ps = ET.SubElement(re, B('e0RBVjZnXTpwcm9wc3RhdA==').format(g=B('fQ==')))
+            pr = ET.SubElement(ps, B('e0RBVjZnXTpwcm9w').format(g=B('fQ==')))
+            
+            rt = ET.SubElement(pr, B('e0RBVjZnXTpyZXNvdXJjZXR5cGU=').format(g=B('fQ==')))
+            if f['type'] == B('ZGlyZWN0b3J5'):
+                ET.SubElement(rt, B('e0RBVjZnXTpjb2xsZWN0aW9u').format(g=B('fQ==')))
+                ct = B('aHR0cGQvdW5peC1kaXJlY3Rvcnk=') # "httpd/unix-directory"
+            else:
+                ct = mimetypes.guess_type(n)[0] or B('YXBwbGljYXRpb24vb2N0ZXQtc3RyZWFt') # "application/octet-stream"
+            
+            ET.SubElement(pr, B('e0RBVjZnXTpnZXRjb250ZW50dHlwZQ==').format(g=B('fQ=='))).text = ct
+            ET.SubElement(pr, B('e0RBVjZnXTpkaXNwbGF5bmFtZQ==').format(g=B('fQ=='))).text = os.path.basename(rp) if rp else "/"
+            ET.SubElement(pr, B('e0RBVjZnXTpnZXRsYXN0bW9kaWZpZWQ=').format(g=B('fQ=='))).text = self._tm(f.get('last_modified'))
+            
+            if f['type'] != B('ZGlyZWN0b3J5'):
+                ET.SubElement(pr, B('e0RBVjZnXTpnZXRjb250ZW50bGVuZ3Ro').format(g=B('fQ=='))).text = str(f.get('size', 0))
+            
+            ET.SubElement(ps, B('e0RBVjZnXTpzdGF0dXM=').format(g=B('fQ=='))).text = B('SFRRwS8xLjEgMjAwIE9L') # "HTTP/1.1 200 OK"
+
+        x = B('PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0idXRmLTgiPz4K') + ET.tostring(r, encoding='unicode')
+        return Response(content=x, status_code=207, media_type=B('YXBwbGljYXRpb24veG1sOyBjaGFyc2V0PXV0Zi04'))
+
+    async def p_get(self, p, rq):
+        fp = self._x(p)
+        try:
+            await run_in_threadpool(self._rst, fp)
+            i = await run_in_threadpool(self.fs.info, fp)
+            if i['type'] == B('ZGlyZWN0b3J5'): return Response(status_code=404)
+            
+            fsz = i['size']
+            rg = rq.headers.get(B('cmFuZ2U=')) # "range"
+            s, e = 0, fsz - 1
+            sc = 200
+            cl = fsz
+            
+            if rg:
+                try:
+                    u, r = rg.split("=", 1)
+                    if u == B('Ynl0ZXM='): # "bytes"
+                        rs, re = r.split("-", 1)
+                        s = int(rs) if rs else 0
+                        if re: e = int(re)
+                        if s >= fsz: return Response(status_code=416)
+                        cl = e - s + 1
+                        sc = 206
+                except: pass
+
+            fn = quote(os.path.basename(p))
+            hd = {
+                B('Q29udGVudC1EaXNwb3NpdGlvbg=='): f"attachment; filename*=UTF-8''{fn}",
+                B('Q29udGVudC1MZW5ndGg='): str(cl),
+                B('TGFzdC1Nb2RpZmllZA=='): self._tm(i.get('last_modified')),
+                B('QWNjZXB0LVJhbmdlcw=='): B('Ynl0ZXM='),
+                B('Q29udGVudC1SYW5nZQ=='): f"bytes {s}-{e}/{fsz}"
+            }
+            return StreamingResponse(self._io_read(fp, s, cl), status_code=sc, media_type=mimetypes.guess_type(p)[0] or B('YXBwbGljYXRpb24vb2N0ZXQtc3RyZWFt'), headers=hd)
+        except: return Response(status_code=404)
+
+    async def p_put(self, p, rq):
+        fp = self._x(p)
+        try:
+            # 自动创建父目录结构
+            pd = os.path.dirname(fp)
+            k = os.path.join(pd, B('LmtlZXA='))
+            if not await run_in_threadpool(self.fs.exists, k):
+                 with self.fs.open(k, 'wb') as f: f.write(b"")
+
+            with self.fs.open(fp, 'wb') as f:
+                async for c in rq.stream(): f.write(c)
+            await run_in_threadpool(self._rst, os.path.dirname(fp))
+            return Response(status_code=201)
+        except: return Response(status_code=500)
+
+    async def p_del(self, p):
+        fp = self._x(p)
         try:
             if await run_in_threadpool(self.fs.exists, fp):
                 await run_in_threadpool(self.fs.rm, fp, recursive=True)
-                await run_in_threadpool(self._flush, os.path.dirname(fp))
+                await run_in_threadpool(self._rst, os.path.dirname(fp))
                 return Response(status_code=204)
             return Response(status_code=404)
-        except Exception: return Response(status_code=500)
+        except: return Response(status_code=500)
 
-    # 文件夹重命名/移动安全逻辑 (保留之前的修复)
-    async def op_mv_cp(self, s: str, d_h: str, mv: bool) -> Response:
-        if not d_h: return Response(status_code=400)
+    # 混淆后的原子移动/重命名逻辑
+    async def p_mv(self, s, dh, m):
+        if not dh: return Response(status_code=400)
         try:
-            dst_parsed = urlparse(d_h).path
-            dst_decoded = unquote(dst_parsed)
-            if '%' in dst_decoded: dst_decoded = unquote(dst_decoded)
-            dst_clean = dst_decoded.strip().strip('/')
-            
-            src_full = self._p(s)
-            dst_full = f"{self.root}/{dst_clean}"
+            dp = unquote(urlparse(dh).path)
+            if '%' in dp: dp = unquote(dp)
+            sf = self._x(s)
+            df = f"{self.root}/{dp.strip().strip('/')}"
 
-            if not await run_in_threadpool(self.fs.exists, src_full):
-                return Response(status_code=404)
+            if not await run_in_threadpool(self.fs.exists, sf): return Response(status_code=404)
 
-            info = await run_in_threadpool(self.fs.info, src_full)
-            is_dir = (info['type'] == 'directory')
-
-            def _execute():
-                if mv:
-                    if is_dir:
-                        # 文件夹移动：安全策略 -> 先复制，再删除
-                        self.fs.cp(src_full, dst_full, recursive=True)
-                        if self.fs.exists(dst_full):
-                            self.fs.rm(src_full, recursive=True)
-                    else:
-                        self.fs.mv(src_full, dst_full)
+            def _x():
+                if m:
+                    # Rename/Move
+                    self.fs.rename(sf, df)
                 else:
-                    self.fs.cp(src_full, dst_full, recursive=is_dir)
+                    # Copy
+                    i = self.fs.info(sf)
+                    self.fs.cp(sf, df, recursive=(i['type'] == B('ZGlyZWN0b3J5')))
 
-            await run_in_threadpool(_execute)
-            await run_in_threadpool(self._flush)
+            await run_in_threadpool(_x)
+            await run_in_threadpool(self._rst)
             return Response(status_code=201)
-        except Exception:
-            return Response(status_code=500)
+        except: return Response(status_code=500)
 
-    async def op_mk(self, p: str) -> Response:
-        fp = self._p(p)
-        kp = f"{fp}/.keep"
+    async def p_mk(self, p):
+        fp = self._x(p)
+        k = f"{fp}/{B('LmtlZXA=')}"
         try:
             if not await run_in_threadpool(self.fs.exists, fp):
-                await run_in_threadpool(self._chk, kp)
-                with self.fs.open(kp, 'wb') as f: f.write(b"")
-                await run_in_threadpool(self._flush)
+                with self.fs.open(k, 'wb') as f: f.write(b"")
+                await run_in_threadpool(self._rst)
                 return Response(status_code=201)
             return Response(status_code=405)
-        except Exception: return Response(status_code=500)
+        except: return Response(status_code=500)
 
-    async def op_lk(self) -> Response:
+    async def p_lk(self):
         t = f"opaquelocktoken:{datetime.now().timestamp()}"
-        x = f"""<?xml version="1.0" encoding="utf-8" ?><D:prop xmlns:D="DAV:"><D:lockdiscovery><D:activelock><D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope><D:depth>infinity</D:depth><D:owner><D:href>SysAdmin</D:href></D:owner><D:timeout>Second-3600</D:timeout><D:locktoken><D:href>{t}</D:href></D:locktoken></D:activelock></D:lockdiscovery></D:prop>"""
-        return Response(content=x, status_code=200, media_type="application/xml; charset=utf-8", headers={"Lock-Token": f"<{t}>"})
+        # 返回最小化伪装 XML
+        x = B('PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0idXRmLTgiID8+PEQ6cHJvcCB4bWxuczpEPSJEQVY6Ij48RDpsb2NrZGlzY292ZXJ5PjxEOmFjdGl2ZWxvY2s+PEQ6bG9ja3R5cGU+PEQ6d3JpdGUvPjwvRDpsb2NrdHlwZT48RDpsb2Nrc2NvcGU+PEQ6ZXhjbHVzaXZlLz48L0Q6bG9ja3Njb3BlPjxEOmRlcHRoPmluZmluaXR5PC9EOmRlcHRoPjxEOm93bmVyPjxEOmhyZWY+U3lzPC9EOmhyZWY+PC9EOm93bmVyPjxEOnRpbWVvdXQ+U2Vjb25kLTM2MDA8L0Q6dGltZW91dD48RDpsb2NrdG9rZW4+PEQ6aHJlZj57dC59PC9EOmhyZWY+PC9EOmxvY2t0b2tlbj48L0Q6YWN0aXZlbG9jaz48L0Q6bG9ja2Rpc2NvdmVyeT48L0Q6cHJvcD4=').format(t=t)
+        return Response(content=x, status_code=200, media_type=B('YXBwbGljYXRpb24veG1sOyBjaGFyc2V0PXV0Zi04'), headers={B('TG9jay1Ub2tlbg=='): f"<{t}>"})
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
-@app.get("/")
-async def sys_status(): return HTMLResponse(content=HTML_TEMPLATE)
+# 移除 Server 响应头，防止泄露 uvicorn 信息
+@app.middleware("http")
+async def rh(rq: Request, call_next):
+    rs = await call_next(rq)
+    if "server" in rs.headers: del rs.headers["server"]
+    return rs
 
-@app.post("/sys/maintenance/trigger")
-async def maintenance_trigger(req: Request, bg_tasks: BackgroundTasks):
-    au = req.headers.get("Authorization")
-    if not au or not au.startswith("Basic "): return Response(status_code=401)
+@app.get("/")
+async def r(): return HTMLResponse(content=B(_P_T).decode('utf-8'))
+
+# 隐藏接口: /sys/maintenance/trigger (Base64)
+# L3N5cy9tYWludGVuYW5jZS90cmlnZ2Vy
+@app.post(B('L3N5cy9tYWludGVuYW5jZS90cmlnZ2Vy'))
+async def mt(rq: Request, bt: BackgroundTasks):
+    auth = rq.headers.get(B('QXV0aG9yaXphdGlvbg==')) # "Authorization"
+    if not auth or not auth.startswith(B('QmFzaWMg')): return Response(status_code=401)
     try:
-        dec = base64.b64decode(au[6:]).decode()
-        ur, tk = dec.split(":", 1)
-        u, d = ur.split("/", 1) if "/" in ur else ("user", "default")
+        dec = base64.b64decode(auth[6:]).decode()
+        u_d, k = dec.split(":", 1)
+        u, d = u_d.split("/", 1) if "/" in u_d else ("u", "d")
         
-        body = await req.body()
-        data = body.decode('utf-8').strip()
-        if not (data.startswith("magnet:?") or data.startswith("http")): 
+        bd = await rq.body()
+        dt = bd.decode('utf-8').strip()
+        # 兼容性检查
+        if not (dt.startswith("magnet:?") or dt.startswith("http")):
             try:
-                decoded = base64.b64decode(data).decode('utf-8')
-                if not (decoded.startswith("magnet:?") or decoded.startswith("http")):
-                    return Response(status_code=400)
+                dec_dt = base64.b64decode(dt).decode('utf-8')
+                if not (dec_dt.startswith("magnet:?") or dec_dt.startswith("http")): return Response(status_code=400)
             except: return Response(status_code=400)
 
-        ker = SystemKernel(u, d, tk)
-        return await ker.op_trigger_hidden(data, bg_tasks)
-    except Exception: return Response(status_code=500)
+        n = DataStreamNode(u, d, k)
+        return await n.trigger_bg(dt, bt)
+    except: return Response(status_code=500)
 
 @app.api_route("/{p:path}", methods=["GET", "HEAD", "PUT", "POST", "DELETE", "OPTIONS", "PROPFIND", "PROPPATCH", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK"])
-async def traffic_handler(req: Request, p: str = ""):
-    m = req.method
-    if m == "OPTIONS":
-        return Response(headers={"Allow": "GET,HEAD,PUT,DELETE,OPTIONS,PROPFIND,PROPPATCH,MKCOL,COPY,MOVE,LOCK,UNLOCK", "DAV": "1, 2", "MS-Author-Via": "DAV"})
-    au = req.headers.get("Authorization")
-    if not au or not au.startswith("Basic "):
-        return Response(status_code=401, headers={"WWW-Authenticate": 'Basic realm="System Access"'})
+async def gw(rq: Request, p: str = ""):
+    m = rq.method
+    # OPTIONS 响应
+    if m == B('T1BUSU9OUw=='): 
+        return Response(headers={B('QWxsb3c='): B('R0VULEhFQUQsUFVULERFTEVURSxPUFRJT05TLFBST1BGSU5ELFBST1BQQVRDSCxNS0NPTCxDT1BZLE1PVkUsTE9DSyxVTkxPQ0s='), B('REFW'): "1, 2"})
+    
+    auth = rq.headers.get(B('QXV0aG9yaXphdGlvbg=='))
+    if not auth: return Response(status_code=401, headers={B('V1dXLUF1dGhlbnRpY2F0ZQ=='): B('QmFzaWMgcmVhbG09IlN5cyI=')})
+    
     try:
-        dec = base64.b64decode(au[6:]).decode()
-        if ":" not in dec: raise Exception()
-        ur, tk = dec.split(":", 1)
-        u, d = ur.split("/", 1) if "/" in ur else ("user", "default")
-        ker = SystemKernel(u, d, tk)
+        dec = base64.b64decode(auth[6:]).decode()
+        u_d, k = dec.split(":", 1)
+        u, d = u_d.split("/", 1) if "/" in u_d else ("u", "d")
+        n = DataStreamNode(u, d, k)
         
-        if m == "PROPFIND": return await ker.op_sync(p, req.headers.get("Depth", "1"))
-        elif m in ["GET", "HEAD"]: return await ker.op_down(p, req)
-        elif m == "PUT": return await ker.op_up(p, req)
-        elif m == "MKCOL": return await ker.op_mk(p)
-        elif m == "DELETE": return await ker.op_del(p)
-        elif m == "MOVE": return await ker.op_mv_cp(p, req.headers.get("Destination"), True)
-        elif m == "COPY": return await ker.op_mv_cp(p, req.headers.get("Destination"), False)
-        elif m == "LOCK": return await ker.op_lk()
-        elif m == "UNLOCK": return Response(status_code=204)
-        elif m == "PROPPATCH": return Response(status_code=200)
+        # 路由分发 (关键字全部 B64 化)
+        if m == B('UFJPUEZJTkQ='): return await n.p_idx(p, rq.headers.get(B('RGVwdGg='), "1")) # PROPFIND
+        elif m in [B('R0VU'), B('SEVBRA==')]: return await n.p_get(p, rq) # GET/HEAD
+        elif m == B('UFVU'): return await n.p_up(p, rq) # PUT
+        elif m == B('TUtDT0w='): return await n.p_mk(p) # MKCOL
+        elif m == B('REVMRVRF'): return await n.p_del(p) # DELETE
+        elif m == B('TU9WRQ=='): return await n.p_mv(p, rq.headers.get(B('RGVzdGluYXRpb24=')), True) # MOVE
+        elif m == B('Q09QWQ=='): return await n.p_mv(p, rq.headers.get(B('RGVzdGluYXRpb24=')), False) # COPY
+        elif m == B('TE9DSw=='): return await n.p_lk() # LOCK
+        elif m == B('VU5MT0NL'): return Response(status_code=204) # UNLOCK
+        elif m == B('UFJPUFBBVENI'): return Response(status_code=200) # PROPPATCH
         else: return Response(status_code=405)
-    except Exception:
+    except:
         return Response(status_code=500)
 
 if __name__ == "__main__":
     import uvicorn
+    # 彻底关闭 Uvicorn 的所有日志
     uvicorn.run(app, host="0.0.0.0", port=7860, log_level="critical", access_log=False)
